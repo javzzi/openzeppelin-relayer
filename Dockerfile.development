@@ -47,8 +47,16 @@ RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
 
 ENV PATH="/usr/local/bin:$PATH"
 
+# Optional: override npm/pnpm registry (e.g. for corporate Artifactory proxy)
+ARG NPM_REGISTRY=""
+ARG NPM_REGISTRY_TOKEN=""
+
 # Install pnpm and ts-node
-RUN npm install -g pnpm ts-node typescript
+RUN if [ -n "$NPM_REGISTRY" ]; then \
+      npm config set registry "$NPM_REGISTRY" && \
+      npm config set "${NPM_REGISTRY#https:}:_authToken" "$NPM_REGISTRY_TOKEN"; \
+    fi && \
+    npm install -g pnpm ts-node typescript
 
 # removes apk and unneeded wolfi-base tools.
 RUN apk del wolfi-base apk-tools
@@ -58,7 +66,11 @@ COPY --chown=nonroot:nonroot ./plugins /app/plugins
 
 USER nonroot
 WORKDIR /app/plugins
-RUN pnpm install --frozen-lockfile
+RUN if [ -n "$NPM_REGISTRY" ]; then \
+      pnpm config set registry "$NPM_REGISTRY" && \
+      pnpm config set "${NPM_REGISTRY#https:}:_authToken" "$NPM_REGISTRY_TOKEN"; \
+    fi && \
+    pnpm install --frozen-lockfile
 
 # Return to app root
 WORKDIR /app
