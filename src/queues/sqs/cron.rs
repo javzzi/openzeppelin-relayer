@@ -18,11 +18,13 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::ServerConfig,
     constants::{
+        LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE, LOAD_INDEX_RECONCILIATION_LOCK_TTL_SECS,
         SYSTEM_CLEANUP_CRON_SCHEDULE, SYSTEM_CLEANUP_LOCK_TTL_SECS, TOKEN_SWAP_CRON_LOCK_TTL_SECS,
         TRANSACTION_CLEANUP_CRON_SCHEDULE, TRANSACTION_CLEANUP_LOCK_TTL_SECS,
     },
     jobs::{
-        system_cleanup_handler, token_swap_cron_handler, transaction_cleanup_handler,
+        load_index_reconciliation_handler, system_cleanup_handler, token_swap_cron_handler,
+        transaction_cleanup_handler, LoadIndexReconciliationCronReminder,
         SystemCleanupCronReminder, TokenSwapCronReminder, TransactionCleanupCronReminder,
     },
     models::{DefaultAppState, RelayerNetworkPolicy},
@@ -100,6 +102,29 @@ impl SqsCronScheduler {
                             .await
                     {
                         warn!(error = %e, "System cleanup handler failed");
+                    }
+                })
+            },
+        )?);
+
+        // Load index reconciliation: every 5 minutes, lock TTL 4 min
+        handles.push(spawn_cron_task(
+            "sqs-cron-load-index-reconciliation",
+            LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE,
+            Duration::from_secs(LOAD_INDEX_RECONCILIATION_LOCK_TTL_SECS),
+            self.app_state.clone(),
+            self.shutdown_rx.clone(),
+            |state| {
+                Box::pin(async move {
+                    let ctx = WorkerContext::new(0, uuid::Uuid::new_v4().to_string());
+                    if let Err(e) = load_index_reconciliation_handler(
+                        LoadIndexReconciliationCronReminder(),
+                        (*state).clone(),
+                        ctx,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "Load index reconciliation handler failed");
                     }
                 })
             },
@@ -419,6 +444,14 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_cron_lock_ttl_five_minute_offset_schedule() {
+        // Used by LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE
+        let ttl = derive_cron_lock_ttl("0 1/5 * * * *", Duration::from_secs(240));
+        // 300s - 5s = 295s
+        assert_eq!(ttl, Duration::from_secs(295));
+    }
+
+    #[test]
     fn test_derive_cron_lock_ttl_daily_schedule() {
         let ttl = derive_cron_lock_ttl("0 0 0 * * *", Duration::from_secs(240));
         // 86400s - 5s = 86395s
@@ -619,6 +652,22 @@ mod tests {
             "System cleanup TTL should be < 900s (interval), got {}s",
             sys_cleanup_ttl.as_secs()
         );
+
+        let reconciliation_ttl = derive_cron_lock_ttl(
+            LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE,
+            Duration::from_secs(LOAD_INDEX_RECONCILIATION_LOCK_TTL_SECS),
+        );
+        // 5 min interval → ~295s TTL
+        assert!(
+            reconciliation_ttl.as_secs() > 200,
+            "Load index reconciliation TTL should be > 200s, got {}s",
+            reconciliation_ttl.as_secs()
+        );
+        assert!(
+            reconciliation_ttl.as_secs() < 300,
+            "Load index reconciliation TTL should be < 300s (interval), got {}s",
+            reconciliation_ttl.as_secs()
+        );
     }
 
     // ── spawn_cron_task: error path ───────────────────────────────────
@@ -655,6 +704,7 @@ mod tests {
         let expressions = [
             TRANSACTION_CLEANUP_CRON_SCHEDULE,
             SYSTEM_CLEANUP_CRON_SCHEDULE,
+            LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE,
         ];
 
         for expr in &expressions {

@@ -269,6 +269,9 @@ where
         .apply_json_patch(&patch)
         .map_err(ApiError::from)?;
 
+    // Capture paused state before the move into RelayerRepoUpdater
+    let old_paused = relayer.paused;
+
     // Use existing RelayerRepoUpdater to preserve runtime fields
     let updated_repo_model =
         RelayerRepoUpdater::from_existing(relayer).apply_domain_update(updated_domain);
@@ -277,6 +280,27 @@ where
         .relayer_repository
         .update(relayer_id.clone(), updated_repo_model)
         .await?;
+
+    // Update load index when paused state changes (best-effort)
+    if old_paused != saved_relayer.paused {
+        let count = state
+            .transaction_repository
+            .count_by_status(
+                &saved_relayer.id,
+                &[
+                    TransactionStatus::Pending,
+                    TransactionStatus::Sent,
+                    TransactionStatus::Submitted,
+                    TransactionStatus::Mined,
+                ],
+            )
+            .await
+            .unwrap_or(0);
+        state
+            .relayer_repository
+            .update_load_index_for_pause(&saved_relayer, count)
+            .await;
+    }
 
     let relayer_response: RelayerResponse = saved_relayer.into();
     Ok(HttpResponse::Ok().json(ApiResponse::success(relayer_response)))
@@ -436,6 +460,62 @@ pub async fn send_transaction(
     let transaction_response: TransactionResponse = transaction.into();
 
     Ok(HttpResponse::Ok().json(ApiResponse::success(transaction_response)))
+}
+
+/// Sends a transaction to the least-loaded relayer for the given network.
+///
+/// Reads the load index sorted set to pick the relayer with the fewest in-flight
+/// transactions, then delegates to `send_transaction`. The `network` field in the
+/// request body identifies the target network (e.g. `"evm:base"`).
+///
+/// # Errors
+///
+/// Returns `400 Bad Request` if the `network` field is missing or malformed.
+/// Returns `404 Not Found` if no relayers are registered for the network.
+pub async fn send_balanced_transaction(
+    request: web::Json<serde_json::Value>,
+    state: web::ThinData<DefaultAppState>,
+) -> Result<HttpResponse, ApiError> {
+    let body = request.into_inner();
+
+    // Extract and parse "network" field (format: "{network_type}:{network_name}")
+    let network_id = body
+        .get("network")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("\"network\" field is required (e.g. \"evm:base\")".to_string()))?;
+
+    let (network_type_str, network_name) = network_id.split_once(':').ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Invalid network format \"{network_id}\": expected \"{{type}}:{{name}}\" (e.g. \"evm:base\")"
+        ))
+    })?;
+
+    // Validate network type against known variants
+    let network_type: NetworkType =
+        serde_json::from_value(serde_json::Value::String(network_type_str.to_string()))
+            .map_err(|_| {
+                ApiError::BadRequest(format!("Unknown network type \"{network_type_str}\""))
+            })?;
+
+    // Look up the least-loaded relayer via the load index
+    let relayer_id = state
+        .relayer_repository
+        .pick_least_loaded(&network_type, network_name)
+        .await
+        .map_err(|e| ApiError::InternalError(format!("Load index query failed: {e}")))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "No active relayers found for network \"{network_id}\""
+            ))
+        })?;
+
+    // Strip "network" from body before delegating to send_transaction
+    let mut tx_body = body;
+    if let Some(obj) = tx_body.as_object_mut() {
+        obj.remove("network");
+    }
+
+    send_transaction(relayer_id, tx_body, state).await
 }
 
 /// Retrieves a transaction by its ID for a specific relayer.

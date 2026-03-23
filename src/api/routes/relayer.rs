@@ -89,6 +89,16 @@ async fn send_transaction(
     relayer::send_transaction(relayer_id.into_inner(), req.into_inner(), data).await
 }
 
+/// Sends a transaction via the least-loaded relayer for the given network.
+/// The body must include a `"network"` field (e.g. `"evm:base"`).
+#[post("/relayers/transactions")]
+async fn send_balanced_transaction(
+    req: web::Json<serde_json::Value>,
+    data: web::ThinData<DefaultAppState>,
+) -> impl Responder {
+    relayer::send_balanced_transaction(req, data).await
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct TransactionPath {
     relayer_id: String,
@@ -221,6 +231,7 @@ pub fn init(cfg: &mut web::ServiceConfig) {
     cfg.service(delete_pending_transactions); // /relayers/{id}/transactions/pending
     cfg.service(quote_sponsored_transaction); // /relayers/{id}/transactions/sponsored/quote
     cfg.service(build_sponsored_transaction); // /relayers/{id}/transactions/sponsored/build
+    cfg.service(send_balanced_transaction); // /relayers/transactions (must be before /{id}/transactions)
 
     // Then register other routes
     cfg.service(cancel_transaction); // /relayers/{id}/transactions/{tx_id}
@@ -446,6 +457,14 @@ mod tests {
         let req = test::TestRequest::post()
             .uri("/relayers/test-id/transactions")
             .set_json(serde_json::json!({}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Test POST /relayers/transactions (balanced)
+        let req = test::TestRequest::post()
+            .uri("/relayers/transactions")
+            .set_json(serde_json::json!({"network": "evm:ethereum"}))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

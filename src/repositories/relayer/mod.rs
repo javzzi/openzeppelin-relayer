@@ -28,7 +28,8 @@ pub use relayer_redis::*;
 use crate::{
     models::UpdateRelayerRequest,
     models::{
-        DisabledReason, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel, RepositoryError,
+        DisabledReason, NetworkType, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel,
+        RepositoryError,
     },
     repositories::{PaginatedResult, Repository},
     utils::RedisConnections,
@@ -81,6 +82,28 @@ pub trait RelayerRepository: Repository<RelayerRepoModel, String> + Send + Sync 
     fn connection_info(&self) -> Option<(Arc<Pool>, String)> {
         None
     }
+
+    /// Returns the ID of the least-loaded relayer for the given network.
+    /// Used by the load balancer to route transactions.
+    /// Returns None if no active relayers exist for the network.
+    async fn pick_least_loaded(
+        &self,
+        network_type: &NetworkType,
+        network: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let _ = (network_type, network);
+        Ok(None)
+    }
+
+    /// Updates the load index when a relayer's paused state changes.
+    /// Best-effort: failures are logged but don't propagate.
+    async fn update_load_index_for_pause(
+        &self,
+        relayer: &RelayerRepoModel,
+        in_flight_count: u64,
+    ) {
+        let _ = (relayer, in_flight_count);
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +134,8 @@ mockall::mock! {
         async fn update_policy(&self, id: String, policy: RelayerNetworkPolicy) -> Result<RelayerRepoModel, RepositoryError>;
         fn is_persistent_storage(&self) -> bool;
         fn connection_info(&self) -> Option<(Arc<Pool>, String)>;
+        async fn pick_least_loaded(&self, network_type: &NetworkType, network: &str) -> Result<Option<String>, RepositoryError>;
+        async fn update_load_index_for_pause(&self, relayer: &RelayerRepoModel, in_flight_count: u64);
     }
 }
 
@@ -324,6 +349,30 @@ impl RelayerRepository for RelayerRepositoryStorage {
             RelayerRepositoryStorage::InMemory(_) => None,
             RelayerRepositoryStorage::Redis(repo) => {
                 Some((repo.connections.primary().clone(), repo.key_prefix.clone()))
+            }
+        }
+    }
+
+    async fn pick_least_loaded(
+        &self,
+        network_type: &NetworkType,
+        network: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        match self {
+            RelayerRepositoryStorage::InMemory(_) => Ok(None),
+            RelayerRepositoryStorage::Redis(repo) => repo.pick_least_loaded(network_type, network).await,
+        }
+    }
+
+    async fn update_load_index_for_pause(
+        &self,
+        relayer: &RelayerRepoModel,
+        in_flight_count: u64,
+    ) {
+        match self {
+            RelayerRepositoryStorage::InMemory(_) => {}
+            RelayerRepositoryStorage::Redis(repo) => {
+                repo.update_load_index_for_pause(relayer, in_flight_count).await;
             }
         }
     }
@@ -573,6 +622,26 @@ mod tests {
 
         // Test the struct's own connection_info method
         let result: Option<(Arc<Pool>, String)> = storage.connection_info();
+        assert!(result.is_none());
+    }
+
+    #[actix_web::test]
+    async fn test_update_load_index_for_pause_noop_for_in_memory() {
+        let repo = RelayerRepositoryStorage::new_in_memory();
+        let relayer = create_test_relayer("test-relayer".to_string());
+
+        // Should be a no-op without panicking
+        repo.update_load_index_for_pause(&relayer, 5).await;
+    }
+
+    #[actix_web::test]
+    async fn test_pick_least_loaded_returns_none_for_in_memory() {
+        let repo = RelayerRepositoryStorage::new_in_memory();
+
+        let result = repo
+            .pick_least_loaded(&NetworkType::Evm, "ethereum")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 }

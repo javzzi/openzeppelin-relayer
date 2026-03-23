@@ -63,3 +63,18 @@ pub const SYSTEM_CLEANUP_LOCK_TTL_SECS: u64 = 14 * 60;
 /// schedule expression (for example, parse failures). In normal operation,
 /// token-swap lock TTL is derived from the cron interval in SQS cron scheduler.
 pub const TOKEN_SWAP_CRON_LOCK_TTL_SECS: u64 = 4 * 60;
+
+/// Cron expression for load index reconciliation: runs every 5 minutes
+/// Offset by 1 minute (runs at :01, :06, :11, ...) to avoid overlap with
+/// transaction cleanup (:00, :10, :20, ...) and system cleanup (:00, :15, :30, ...).
+pub const LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE: &str = "0 1/5 * * * *";
+
+/// TTL for the load index reconciliation distributed lock (4 minutes).
+///
+/// This value should be:
+/// 1. Greater than the worst-case reconciliation runtime to prevent concurrent execution
+/// 2. Less than the cron interval (5 minutes) to ensure availability for the next run
+pub const LOAD_INDEX_RECONCILIATION_LOCK_TTL_SECS: u64 = 4 * 60;
+
+/// Number of retries for the load index reconciliation job
+pub const WORKER_LOAD_INDEX_RECONCILIATION_RETRIES: usize = 3;

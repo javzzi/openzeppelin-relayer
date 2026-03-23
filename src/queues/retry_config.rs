@@ -67,6 +67,12 @@ pub const SYSTEM_CLEANUP_BACKOFF: RetryBackoffConfig = RetryBackoffConfig {
     max_ms: 20000,
     jitter: 0.99,
 };
+/// Backoff profile for load-index reconciliation retries.
+pub const LOAD_INDEX_RECONCILIATION_BACKOFF: RetryBackoffConfig = RetryBackoffConfig {
+    initial_ms: 5000,
+    max_ms: 20000,
+    jitter: 0.99,
+};
 /// Backoff profile for relayer-health-check retries.
 pub const RELAYER_HEALTH_BACKOFF: RetryBackoffConfig = RetryBackoffConfig {
     initial_ms: 2000,

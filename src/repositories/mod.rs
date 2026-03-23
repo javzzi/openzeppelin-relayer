@@ -2,7 +2,7 @@
 //!
 //! Implements data persistence layer for the relayer service using Repository pattern.
 
-use crate::models::{PaginationQuery, RepositoryError};
+use crate::models::{PaginationQuery, RepositoryError, TransactionStatus};
 use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub struct TransactionDeleteRequest {
     pub relayer_id: String,
     /// Nonce if available (needed for nonce index cleanup, EVM-specific)
     pub nonce: Option<u64>,
+    /// Transaction status at deletion time (used for load index cleanup).
+    /// None means the load index will not be decremented for this request.
+    pub status: Option<TransactionStatus>,
 }
 
 impl TransactionDeleteRequest {
@@ -75,6 +78,7 @@ impl TransactionDeleteRequest {
             id,
             relayer_id,
             nonce,
+            status: None,
         }
     }
 }

@@ -23,7 +23,7 @@ use crate::{
     jobs::JobProducerTrait,
     models::{
         NetworkRepoModel, NotificationRepoModel, RelayerRepoModel, SignerRepoModel,
-        ThinDataAppState, TransactionRepoModel,
+        ThinDataAppState, TransactionRepoModel, TransactionStatus,
     },
     repositories::{
         ApiKeyRepositoryTrait, NetworkRepository, PluginRepositoryTrait, RelayerRepository,
@@ -439,7 +439,72 @@ where
         ));
     }
 
+    // Populate load index for all active relayers
+    if let Some((pool, prefix)) = app_state.relayer_repository.connection_info() {
+        populate_load_index(relayers, &app_state.transaction_repository, &pool, &prefix).await;
+    }
+
     Ok(())
+}
+
+/// Populates the load index sorted sets from the current transaction state.
+/// Called once at startup to ensure the index reflects in-flight transaction counts.
+/// Best-effort: failures are logged as warnings and do not block startup.
+async fn populate_load_index<TR>(
+    relayers: &[RelayerRepoModel],
+    transaction_repository: &Arc<TR>,
+    pool: &Arc<Pool>,
+    prefix: &str,
+) where
+    TR: TransactionRepository + Repository<TransactionRepoModel, String> + Send + Sync + 'static,
+{
+    use redis::AsyncCommands;
+
+    let in_flight_statuses = [
+        TransactionStatus::Pending,
+        TransactionStatus::Sent,
+        TransactionStatus::Submitted,
+        TransactionStatus::Mined,
+    ];
+
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "load index: failed to get Redis connection for bootstrap");
+            return;
+        }
+    };
+
+    for relayer in relayers.iter().filter(|r| !r.paused && !r.system_disabled) {
+        let count = transaction_repository
+            .count_by_status(&relayer.id, &in_flight_statuses)
+            .await
+            .unwrap_or(0);
+
+        let load_key = format!(
+            "{}:load_index:{}:{}",
+            prefix, relayer.network_type, relayer.network
+        );
+
+        if let Err(e) = conn
+            .zadd::<_, _, _, ()>(&load_key, &relayer.id, count as f64)
+            .await
+        {
+            warn!(
+                relayer_id = %relayer.id,
+                error = %e,
+                "load index: failed to populate during bootstrap"
+            );
+        } else {
+            debug!(
+                relayer_id = %relayer.id,
+                count = %count,
+                "load index: populated"
+            );
+        }
+    }
+
+    info!("load index bootstrap complete");
 }
 
 #[cfg(test)]

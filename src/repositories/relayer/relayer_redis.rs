@@ -2,19 +2,22 @@
 
 use crate::models::UpdateRelayerRequest;
 use crate::models::{
-    DisabledReason, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel, RepositoryError,
+    DisabledReason, NetworkType, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel,
+    RepositoryError,
 };
 use crate::repositories::redis_base::RedisRepository;
 use crate::repositories::{BatchRetrievalResult, PaginatedResult, RelayerRepository, Repository};
 use crate::utils::RedisConnections;
 use async_trait::async_trait;
-use redis::AsyncCommands;
+use redis::{AsyncCommands, Script};
 use std::fmt;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 const RELAYER_PREFIX: &str = "relayer";
 const RELAYER_LIST_KEY: &str = "relayer_list";
+const LOAD_INDEX_PREFIX: &str = "load_index";
+const RELAYER_NETWORK_PREFIX: &str = "relayer_network";
 
 #[derive(Clone)]
 pub struct RedisRelayerRepository {
@@ -49,6 +52,19 @@ impl RedisRelayerRepository {
     /// Generate key for relayer list: relayer_list (set of all relayer IDs)
     fn relayer_list_key(&self) -> String {
         format!("{}:{}", self.key_prefix, RELAYER_LIST_KEY)
+    }
+
+    /// Generate key for load index sorted set: load_index:{network_type}:{network}
+    pub fn load_index_key(&self, network_type: &NetworkType, network: &str) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.key_prefix, LOAD_INDEX_PREFIX, network_type, network
+        )
+    }
+
+    /// Generate key for relayer network reverse lookup: relayer_network:{relayer_id}
+    fn relayer_network_key(&self, relayer_id: &str) -> String {
+        format!("{}:{}:{}", self.key_prefix, RELAYER_NETWORK_PREFIX, relayer_id)
     }
 
     /// Batch fetch relayers by IDs
@@ -159,6 +175,12 @@ impl Repository<RelayerRepoModel, String> for RedisRelayerRepository {
         pipe.atomic();
         pipe.set(&relayer_key, &serialized);
         pipe.sadd(self.relayer_list_key(), &entity.id);
+        // Initialize load index with score 0 (no in-flight transactions yet)
+        let load_key = self.load_index_key(&entity.network_type, &entity.network);
+        pipe.zadd(&load_key, &entity.id, 0i64);
+        // Store lightweight reverse lookup for network info
+        let relayer_network_key = self.relayer_network_key(&entity.id);
+        pipe.set(&relayer_network_key, format!("{}:{}", entity.network_type, entity.network));
 
         pipe.exec_async(&mut conn)
             .await
@@ -350,23 +372,30 @@ impl Repository<RelayerRepoModel, String> for RedisRelayerRepository {
             .await?;
         let relayer_key = self.relayer_key(&id);
 
-        // Check if relayer exists
-        let exists: bool = conn
-            .exists(&relayer_key)
+        // GET the relayer to get network info for load index cleanup
+        let json: Option<String> = conn
+            .get(&relayer_key)
             .await
-            .map_err(|e| self.map_redis_error(e, "delete_relayer_exists_check"))?;
+            .map_err(|e| self.map_redis_error(e, "delete_relayer_get"))?;
 
-        if !exists {
-            return Err(RepositoryError::NotFound(format!(
-                "Relayer with ID {id} not found"
-            )));
-        }
+        let relayer: RelayerRepoModel = match json {
+            Some(j) => self.deserialize_entity(&j, &id, "relayer")?,
+            None => {
+                return Err(RepositoryError::NotFound(format!(
+                    "Relayer with ID {id} not found"
+                )))
+            }
+        };
 
         // Use pipeline for atomic operations
+        let load_key = self.load_index_key(&relayer.network_type, &relayer.network);
+        let relayer_network_key = self.relayer_network_key(&id);
         let mut pipe = redis::pipe();
         pipe.atomic();
         pipe.del(&relayer_key);
         pipe.srem(self.relayer_list_key(), &id);
+        pipe.zrem(&load_key, &id);
+        pipe.del(&relayer_network_key);
 
         pipe.exec_async(&mut conn)
             .await
@@ -555,6 +584,76 @@ impl RelayerRepository for RedisRelayerRepository {
 
         // Update the relayer
         self.update(id, relayer).await
+    }
+
+    async fn pick_least_loaded(
+        &self,
+        network_type: &NetworkType,
+        network: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let mut conn = self
+            .get_connection(self.connections.primary(), "pick_least_loaded")
+            .await?;
+        let load_key = self.load_index_key(network_type, network);
+
+        // Atomic select-and-increment: picks the least-loaded member and bumps its
+        // score by 1 in a single Redis operation. This prevents multiple distributed
+        // instances from selecting the same relayer before the score is updated.
+        let script = Script::new(
+            r"
+            local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', '+inf', 'LIMIT', 0, 1)
+            if #members == 0 then return false end
+            redis.call('ZINCRBY', KEYS[1], 1, members[1])
+            return members[1]
+            ",
+        );
+
+        let result: redis::Value = script
+            .key(&load_key)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "pick_least_loaded"))?;
+
+        match result {
+            redis::Value::BulkString(bytes) => {
+                String::from_utf8(bytes).map(Some).map_err(|e| {
+                    RepositoryError::InvalidData(format!(
+                        "Invalid UTF-8 in load index member: {e}"
+                    ))
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn update_load_index_for_pause(
+        &self,
+        relayer: &RelayerRepoModel,
+        in_flight_count: u64,
+    ) {
+        let load_key = self.load_index_key(&relayer.network_type, &relayer.network);
+        let mut conn = match self
+            .get_connection(self.connections.primary(), "update_load_index_for_pause")
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    relayer_id = %relayer.id,
+                    error = %e,
+                    "load index: failed to get connection for pause update"
+                );
+                return;
+            }
+        };
+
+        if relayer.paused {
+            let _ = conn.zrem::<_, _, ()>(&load_key, &relayer.id).await;
+        } else {
+            let _ = conn
+                .zadd::<_, _, _, ()>(&load_key, &relayer.id, in_flight_count as f64)
+                .await;
+        }
     }
 
     fn is_persistent_storage(&self) -> bool {
@@ -1122,5 +1221,244 @@ mod tests {
 
         let result = repo.list_by_notification_id("nonexistent").await.unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_pick_least_loaded_empty_index_returns_none() {
+        let repo = setup_test_repo().await;
+
+        let result = repo
+            .pick_least_loaded(&NetworkType::Evm, "nonexistent")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_pick_least_loaded_returns_lowest_score() {
+        let repo = setup_test_repo().await;
+
+        // Create two relayers — they get added to the load index with score 0
+        let id_a = uuid::Uuid::new_v4().to_string();
+        let id_b = uuid::Uuid::new_v4().to_string();
+        repo.create(create_test_relayer(&id_a)).await.unwrap();
+        repo.create(create_test_relayer(&id_b)).await.unwrap();
+
+        // Bump relayer A's score so B has the lower score
+        let load_key = repo.load_index_key(&NetworkType::Evm, "ethereum");
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let _: () = redis::cmd("ZINCRBY")
+            .arg(&load_key)
+            .arg(5)
+            .arg(&id_a)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        // pick_least_loaded should return B (score 0 < score 5)
+        let picked = repo
+            .pick_least_loaded(&NetworkType::Evm, "ethereum")
+            .await
+            .unwrap();
+        assert_eq!(picked, Some(id_b.clone()));
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_pick_least_loaded_increments_score_atomically() {
+        let repo = setup_test_repo().await;
+
+        // Create two relayers with score 0
+        let id_a = uuid::Uuid::new_v4().to_string();
+        let id_b = uuid::Uuid::new_v4().to_string();
+        repo.create(create_test_relayer(&id_a)).await.unwrap();
+        repo.create(create_test_relayer(&id_b)).await.unwrap();
+
+        // First pick: returns one of them (both at 0, Redis picks lexicographic first)
+        let first = repo
+            .pick_least_loaded(&NetworkType::Evm, "ethereum")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Second pick: should return the OTHER one because the first got incremented to 1
+        let second = repo
+            .pick_least_loaded(&NetworkType::Evm, "ethereum")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first, second, "atomic increment should cause round-robin when scores are tied");
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_pick_least_loaded_single_relayer() {
+        let repo = setup_test_repo().await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        repo.create(create_test_relayer(&id)).await.unwrap();
+
+        let picked = repo
+            .pick_least_loaded(&NetworkType::Evm, "ethereum")
+            .await
+            .unwrap();
+        assert_eq!(picked, Some(id.clone()));
+
+        // Score should now be 1 after the pick
+        let load_key = repo.load_index_key(&NetworkType::Evm, "ethereum");
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let score: f64 = redis::cmd("ZSCORE")
+            .arg(&load_key)
+            .arg(&id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(score, 1.0);
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_update_load_index_for_pause_removes_on_pause() {
+        let repo = setup_test_repo().await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        repo.create(create_test_relayer(&id)).await.unwrap();
+
+        // Verify relayer is in the index
+        let load_key = repo.load_index_key(&NetworkType::Evm, "ethereum");
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&load_key)
+            .arg(&id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(score.is_some());
+
+        // Pause the relayer
+        let mut paused_relayer = create_test_relayer(&id);
+        paused_relayer.paused = true;
+        repo.update_load_index_for_pause(&paused_relayer, 0).await;
+
+        // Verify relayer was removed from the index
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&load_key)
+            .arg(&id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(score.is_none());
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_update_load_index_for_pause_readds_on_unpause() {
+        let repo = setup_test_repo().await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        repo.create(create_test_relayer(&id)).await.unwrap();
+
+        // Remove from index (simulate pause)
+        let load_key = repo.load_index_key(&NetworkType::Evm, "ethereum");
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let _: () = redis::cmd("ZREM")
+            .arg(&load_key)
+            .arg(&id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        // Unpause with in-flight count of 3
+        let relayer = create_test_relayer(&id);
+        repo.update_load_index_for_pause(&relayer, 3).await;
+
+        // Verify relayer was re-added with correct score
+        let score: f64 = redis::cmd("ZSCORE")
+            .arg(&load_key)
+            .arg(&id)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(score, 3.0);
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_create_relayer_sets_relayer_network_key() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let relayer = create_test_relayer(&relayer_id);
+
+        repo.create(relayer.clone()).await.unwrap();
+
+        // Directly query Redis for the relayer_network key
+        let relayer_network_key = format!(
+            "{}:{}:{}",
+            repo.key_prefix, RELAYER_NETWORK_PREFIX, relayer_id
+        );
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let value: String = redis::cmd("GET")
+            .arg(&relayer_network_key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+
+        let expected = format!("{}:{}", relayer.network_type, relayer.network);
+        assert_eq!(value, expected);
+    }
+
+    #[ignore = "Requires active Redis instance"]
+    #[tokio::test]
+    async fn test_delete_relayer_cleans_up_relayer_network_key() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let relayer = create_test_relayer(&relayer_id);
+
+        repo.create(relayer.clone()).await.unwrap();
+
+        // Verify the relayer_network key exists
+        let relayer_network_key = format!(
+            "{}:{}:{}",
+            repo.key_prefix, RELAYER_NETWORK_PREFIX, relayer_id
+        );
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test")
+            .await
+            .unwrap();
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&relayer_network_key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(exists, "relayer_network key should exist after create");
+
+        // Delete the relayer
+        repo.delete_by_id(relayer.id.clone()).await.unwrap();
+
+        // Verify the relayer_network key is gone
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&relayer_network_key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        assert!(!exists, "relayer_network key should be removed after delete");
     }
 }

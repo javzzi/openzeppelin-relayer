@@ -9,17 +9,19 @@ use actix_web::web::ThinData;
 use crate::{
     config::ServerConfig,
     constants::{
-        SYSTEM_CLEANUP_CRON_SCHEDULE, TRANSACTION_CLEANUP_CRON_SCHEDULE,
+        LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE, SYSTEM_CLEANUP_CRON_SCHEDULE,
+        TRANSACTION_CLEANUP_CRON_SCHEDULE, WORKER_LOAD_INDEX_RECONCILIATION_RETRIES,
         WORKER_SYSTEM_CLEANUP_RETRIES, WORKER_TOKEN_SWAP_REQUEST_RETRIES,
         WORKER_TRANSACTION_CLEANUP_RETRIES,
     },
     jobs::{
-        notification_handler, relayer_health_check_handler, system_cleanup_handler,
-        token_swap_cron_handler, token_swap_request_handler, transaction_cleanup_handler,
-        transaction_request_handler, transaction_status_handler, transaction_submission_handler,
-        Job, JobProducerTrait, NotificationSend, RelayerHealthCheck, SystemCleanupCronReminder,
-        TokenSwapCronReminder, TokenSwapRequest, TransactionCleanupCronReminder,
-        TransactionRequest, TransactionSend, TransactionStatusCheck,
+        load_index_reconciliation_handler, notification_handler, relayer_health_check_handler,
+        system_cleanup_handler, token_swap_cron_handler, token_swap_request_handler,
+        transaction_cleanup_handler, transaction_request_handler, transaction_status_handler,
+        transaction_submission_handler, Job, JobProducerTrait, LoadIndexReconciliationCronReminder,
+        NotificationSend, RelayerHealthCheck, SystemCleanupCronReminder, TokenSwapCronReminder,
+        TokenSwapRequest, TransactionCleanupCronReminder, TransactionRequest, TransactionSend,
+        TransactionStatusCheck,
     },
     models::{
         DefaultAppState, NetworkRepoModel, NotificationRepoModel, RelayerNetworkPolicy,
@@ -47,10 +49,10 @@ use tracing::{debug, error, info};
 
 use super::{filter_relayers_for_swap, QueueType, WorkerContext};
 use crate::queues::retry_config::{
-    RetryBackoffConfig, NOTIFICATION_BACKOFF, RELAYER_HEALTH_BACKOFF, STATUS_EVM_BACKOFF,
-    STATUS_GENERIC_BACKOFF, STATUS_STELLAR_BACKOFF, SYSTEM_CLEANUP_BACKOFF,
-    TOKEN_SWAP_CRON_BACKOFF, TOKEN_SWAP_REQUEST_BACKOFF, TX_CLEANUP_BACKOFF, TX_REQUEST_BACKOFF,
-    TX_SUBMISSION_BACKOFF,
+    RetryBackoffConfig, LOAD_INDEX_RECONCILIATION_BACKOFF, NOTIFICATION_BACKOFF,
+    RELAYER_HEALTH_BACKOFF, STATUS_EVM_BACKOFF, STATUS_GENERIC_BACKOFF, STATUS_STELLAR_BACKOFF,
+    SYSTEM_CLEANUP_BACKOFF, TOKEN_SWAP_CRON_BACKOFF, TOKEN_SWAP_REQUEST_BACKOFF,
+    TX_CLEANUP_BACKOFF, TX_REQUEST_BACKOFF, TX_SUBMISSION_BACKOFF,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +160,18 @@ async fn apalis_system_cleanup_handler(
         .map_err(Into::into)
 }
 
+async fn apalis_load_index_reconciliation_handler(
+    _job: LoadIndexReconciliationCronReminder,
+    state: Data<ThinData<DefaultAppState>>,
+    attempt: Attempt,
+    task_id: TaskId,
+) -> Result<(), apalis::prelude::Error> {
+    let ctx = WorkerContext::new(attempt.current(), task_id.to_string());
+    load_index_reconciliation_handler(LoadIndexReconciliationCronReminder(), (*state).clone(), ctx)
+        .await
+        .map_err(Into::into)
+}
+
 async fn apalis_token_swap_cron_handler(
     _job: TokenSwapCronReminder,
     relayer_id: Data<String>,
@@ -188,6 +202,7 @@ const TOKEN_SWAP_REQUEST: &str = "token_swap_request";
 const TRANSACTION_CLEANUP: &str = "transaction_cleanup";
 const RELAYER_HEALTH_CHECK: &str = "relayer_health_check";
 const SYSTEM_CLEANUP: &str = "system_cleanup";
+const LOAD_INDEX_RECONCILIATION: &str = "load_index_reconciliation";
 
 /// Creates an exponential backoff with configurable parameters
 ///
@@ -391,6 +406,22 @@ where
         )?))
         .build_fn(apalis_system_cleanup_handler);
 
+    let load_index_reconciliation_worker = WorkerBuilder::new(LOAD_INDEX_RECONCILIATION)
+        .layer(ErrorHandlingLayer::new())
+        .enable_tracing()
+        .catch_panic()
+        .retry(
+            RetryPolicy::retries(WORKER_LOAD_INDEX_RECONCILIATION_RETRIES).with_backoff(
+                create_backoff_from_config(LOAD_INDEX_RECONCILIATION_BACKOFF)?.make_backoff(),
+            ),
+        )
+        .concurrency(1)
+        .data(app_state.clone())
+        .backend(CronStream::new(apalis_cron::Schedule::from_str(
+            LOAD_INDEX_RECONCILIATION_CRON_SCHEDULE,
+        )?))
+        .build_fn(apalis_load_index_reconciliation_handler);
+
     let relayer_health_check_worker = WorkerBuilder::new(RELAYER_HEALTH_CHECK)
         .layer(ErrorHandlingLayer::new())
         .enable_tracing()
@@ -417,6 +448,7 @@ where
         .register(token_swap_request_queue_worker)
         .register(transaction_cleanup_queue_worker)
         .register(system_cleanup_queue_worker)
+        .register(load_index_reconciliation_worker)
         .register(relayer_health_check_worker)
         .on_event(monitor_handle_event)
         .shutdown_timeout(Duration::from_millis(5000));

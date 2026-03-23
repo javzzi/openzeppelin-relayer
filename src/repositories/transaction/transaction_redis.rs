@@ -10,8 +10,8 @@ use crate::metrics::{
     TRANSACTIONS_TRY_AGAIN_LATER_SUCCESS, TRANSACTION_PROCESSING_TIME,
 };
 use crate::models::{
-    NetworkTransactionData, PaginationQuery, RepositoryError, TransactionRepoModel,
-    TransactionStatus, TransactionUpdateRequest,
+    NetworkTransactionData, PaginationQuery, RepositoryError,
+    TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
 };
 use crate::repositories::redis_base::RedisRepository;
 use crate::repositories::{
@@ -34,6 +34,8 @@ const NONCE_PREFIX: &str = "nonce";
 const TX_TO_RELAYER_PREFIX: &str = "tx_to_relayer";
 const RELAYER_LIST_KEY: &str = "relayer_list";
 const TX_BY_CREATED_AT_PREFIX: &str = "tx_by_created_at";
+const LOAD_INDEX_PREFIX: &str = "load_index";
+const RELAYER_NETWORK_PREFIX: &str = "relayer_network";
 
 #[derive(Clone)]
 pub struct RedisTransactionRepository {
@@ -112,6 +114,67 @@ impl RedisTransactionRepository {
             "{}:{}:{}:{}",
             self.key_prefix, RELAYER_PREFIX, relayer_id, TX_BY_CREATED_AT_PREFIX
         )
+    }
+
+    /// Generate key for relayer network reverse lookup: relayer_network:{relayer_id}
+    fn relayer_network_key(&self, relayer_id: &str) -> String {
+        format!("{}:{}:{}", self.key_prefix, RELAYER_NETWORK_PREFIX, relayer_id)
+    }
+
+    /// Generate key for load index sorted set: load_index:{network_type}:{network}
+    fn load_index_key(&self, network_type: &str, network: &str) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.key_prefix, LOAD_INDEX_PREFIX, network_type, network
+        )
+    }
+
+    /// Returns true if a transaction status counts as in-flight for load tracking.
+    fn is_in_flight(status: &TransactionStatus) -> bool {
+        matches!(
+            status,
+            TransactionStatus::Pending
+                | TransactionStatus::Sent
+                | TransactionStatus::Submitted
+                | TransactionStatus::Mined
+        )
+    }
+
+    /// Best-effort: fetch relayer network info and ZINCRBY the load index.
+    /// Logs a warning on failure but never propagates the error.
+    async fn update_load_index(&self, relayer_id: &str, delta: f64) {
+        let network_key = self.relayer_network_key(relayer_id);
+        let mut conn = match self
+            .get_connection(self.connections.primary(), "update_load_index")
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(relayer_id = %relayer_id, error = %e, "load index: failed to get connection");
+                return;
+            }
+        };
+
+        let network_info: Option<String> = match conn.get::<_, Option<String>>(&network_key).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(relayer_id = %relayer_id, error = %e, "load index: failed to fetch network info");
+                return;
+            }
+        };
+
+        let (network_type_str, network_name) = match network_info.as_deref().and_then(|s| s.split_once(':')) {
+            Some(parts) => parts,
+            None => {
+                warn!(relayer_id = %relayer_id, "load index: network info not found or malformed");
+                return;
+            }
+        };
+
+        let load_key = self.load_index_key(network_type_str, network_name);
+        if let Err(e) = conn.zincr::<_, _, _, ()>(&load_key, relayer_id, delta).await {
+            warn!(relayer_id = %relayer_id, delta = %delta, error = %e, "load index: ZINCRBY failed");
+        }
     }
 
     /// Returns the components needed for Lua scripts to resolve a tx key from
@@ -583,6 +646,27 @@ impl RedisTransactionRepository {
             self.map_redis_error(e, &format!("update_indexes_for_tx_{}", tx.id))
         })?;
 
+        // Update load index: track in-flight transaction count per relayer
+        let is_new = old_tx.is_none();
+        let was_in_flight = old_tx.map_or(false, |old| Self::is_in_flight(&old.status));
+        let now_in_flight = Self::is_in_flight(&tx.status);
+
+        let delta: Option<f64> = if is_new && now_in_flight {
+            Some(1.0)
+        } else if !is_new && was_in_flight != now_in_flight {
+            if now_in_flight {
+                Some(1.0)
+            } else {
+                Some(-1.0)
+            }
+        } else {
+            None
+        };
+
+        if let Some(d) = delta {
+            self.update_load_index(&tx.relayer_id, d).await;
+        }
+
         debug!(tx_id = %tx.id, "successfully updated indexes for transaction");
         Ok(())
     }
@@ -639,6 +723,11 @@ impl RedisTransactionRepository {
             error!(tx_id = %tx.id, error = %e, "index removal failed for transaction");
             self.map_redis_error(e, &format!("remove_indexes_for_tx_{}", tx.id))
         })?;
+
+        // Decrement load index if this transaction was in-flight
+        if Self::is_in_flight(&tx.status) {
+            self.update_load_index(&tx.relayer_id, -1.0).await;
+        }
 
         debug!(tx_id = %tx.id, "successfully removed all indexes for transaction");
         Ok(())
@@ -2111,7 +2200,7 @@ impl TransactionRepository for RedisTransactionRepository {
         // Fetch transactions to get their data for index cleanup
         let batch_result = self.get_transactions_by_ids(&ids).await?;
 
-        // Convert to delete requests
+        // Convert to delete requests (include status for load index cleanup)
         let requests: Vec<TransactionDeleteRequest> = batch_result
             .results
             .iter()
@@ -2119,6 +2208,7 @@ impl TransactionRepository for RedisTransactionRepository {
                 id: tx.id.clone(),
                 relayer_id: tx.relayer_id.clone(),
                 nonce: self.extract_nonce(&tx.network_data),
+                status: Some(tx.status.clone()),
             })
             .collect();
 
@@ -2201,6 +2291,18 @@ impl TransactionRepository for RedisTransactionRepository {
                     deleted_count = %deleted_count,
                     "batch delete completed"
                 );
+
+                // Best-effort: decrement load index for each in-flight deleted transaction
+                for req in &requests {
+                    if req
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| Self::is_in_flight(s))
+                    {
+                        self.update_load_index(&req.relayer_id, -1.0).await;
+                    }
+                }
+
                 Ok(BatchDeleteResult {
                     deleted_count,
                     failed: vec![],
