@@ -144,6 +144,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Create original price params (legacy)
@@ -205,6 +206,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Create original price params (EIP1559)
@@ -267,6 +269,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original_params = PriceParams {
@@ -363,6 +366,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original_params = PriceParams {
@@ -419,6 +423,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original_params = PriceParams {
@@ -483,6 +488,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original_params = PriceParams {
@@ -532,6 +538,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let params = build_zkevm_transaction_params(&tx);
@@ -562,6 +569,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let minimal_params = build_zkevm_transaction_params(&minimal_tx);
@@ -597,6 +605,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let params_no_prefix = build_zkevm_transaction_params(&tx_without_prefix);

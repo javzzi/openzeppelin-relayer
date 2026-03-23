@@ -158,6 +158,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original = PriceParams {

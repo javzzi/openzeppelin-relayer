@@ -407,7 +407,19 @@ where
         tx_data: &EvmTransactionData,
         relayer: &RelayerRepoModel,
     ) -> Result<PriceParams, TransactionError> {
-        if tx_data.is_legacy() {
+        if tx_data.is_eip7702() {
+            // EIP-7702 always uses EIP-1559 pricing, regardless of network features
+            if tx_data.is_speed() {
+                self.fetch_eip1559_speed_params(
+                    tx_data.speed.as_ref().ok_or(TransactionError::NotSupported(
+                        "Speed is required".to_string(),
+                    ))?,
+                )
+                .await
+            } else {
+                self.fetch_eip1559_price_params(tx_data)
+            }
+        } else if tx_data.is_legacy() {
             self.fetch_legacy_price_params(tx_data)
         } else if tx_data.is_eip1559() {
             self.fetch_eip1559_price_params(tx_data)
@@ -753,6 +765,90 @@ mod tests {
             custom_rpc_urls: None,
             ..Default::default()
         }
+    }
+
+    fn make_auth_item() -> crate::models::transaction::request::evm::SignedAuthorizationItem {
+        crate::models::transaction::request::evm::SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "1b".repeat(32)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eip7702_with_explicit_eip1559_prices() {
+        let mut provider = MockEvmProviderTrait::new();
+        provider
+            .expect_get_balance()
+            .returning(|_| async { Ok(U256::from(1000000000000000000u128)) }.boxed());
+
+        let relayer = create_mock_relayer();
+        let gas_price_service =
+            EvmGasPriceService::new(provider, create_mock_evm_network("mainnet"), None);
+        let pc = PriceCalculator::new(gas_price_service, None);
+
+        let tx_data = EvmTransactionData {
+            max_fee_per_gas: Some(30_000_000_000),
+            max_priority_fee_per_gas: Some(1_000_000_000),
+            authorization_list: Some(vec![make_auth_item()]),
+            ..Default::default()
+        };
+
+        let result = pc.get_transaction_price_params(&tx_data, &relayer).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let params = result.unwrap();
+        assert_eq!(params.max_fee_per_gas, Some(30_000_000_000));
+        assert_eq!(params.max_priority_fee_per_gas, Some(1_000_000_000));
+        assert!(params.gas_price.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_eip7702_with_speed_uses_eip1559_pricing() {
+        let relayer = create_mock_relayer();
+
+        let mut mock_gas_price_service = MockEvmGasPriceServiceTrait::new();
+        let mock_prices = GasPrices {
+            legacy_prices: SpeedPrices {
+                safe_low: 10_000_000_000,
+                average: 12_500_000_000,
+                fast: 15_000_000_000,
+                fastest: 20_000_000_000,
+            },
+            max_priority_fee_per_gas: SpeedPrices {
+                safe_low: 1_000_000_000,
+                average: 2_000_000_000,
+                fast: 3_000_000_000,
+                fastest: 4_000_000_000,
+            },
+            base_fee_per_gas: 50_000_000_000,
+        };
+        mock_gas_price_service
+            .expect_get_prices_from_json_rpc()
+            .returning(move || {
+                let prices = mock_prices.clone();
+                Box::pin(async move { Ok(prices) })
+            });
+        let network = create_mock_evm_network("mainnet");
+        mock_gas_price_service
+            .expect_network()
+            .return_const(network);
+
+        let pc = PriceCalculator::new(mock_gas_price_service, None);
+
+        let tx_data = EvmTransactionData {
+            speed: Some(Speed::Fast),
+            authorization_list: Some(vec![make_auth_item()]),
+            ..Default::default()
+        };
+
+        let result = pc.get_transaction_price_params(&tx_data, &relayer).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let params = result.unwrap();
+        assert!(params.max_fee_per_gas.is_some(), "7702+speed should produce EIP-1559 params");
+        assert!(params.gas_price.is_none(), "7702+speed must not produce legacy gas_price");
     }
 
     #[tokio::test]

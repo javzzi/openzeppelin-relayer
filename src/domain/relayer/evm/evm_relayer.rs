@@ -918,6 +918,7 @@ mod tests {
             max_priority_fee_per_gas: None,
             speed: None,
             valid_until: None,
+            authorization_list: None,
         });
 
         network_repo
@@ -973,6 +974,7 @@ mod tests {
             max_priority_fee_per_gas: None,
             speed: None,
             valid_until: None,
+            authorization_list: None,
         });
 
         network_repo
@@ -1038,6 +1040,7 @@ mod tests {
             max_priority_fee_per_gas: None,
             speed: None,
             valid_until: None,
+            authorization_list: None,
         });
 
         network_repo

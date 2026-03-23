@@ -1553,6 +1553,7 @@ mod tests {
                 hash: None,
                 speed: Some(Speed::Fast),
                 raw: None,
+                authorization_list: None,
             }),
             priced_at: None,
             hashes: Vec::new(),
@@ -2418,6 +2419,7 @@ mod tests {
                 max_priority_fee_per_gas: None,
                 speed: Some(Speed::Fast),
                 valid_until: None,
+                authorization_list: None,
             });
 
             // Call replace_transaction and verify it succeeds
@@ -2488,6 +2490,7 @@ mod tests {
                 max_priority_fee_per_gas: None,
                 speed: Some(Speed::Fast),
                 valid_until: None,
+                authorization_list: None,
             });
 
             // Call replace_transaction and verify it fails
@@ -2534,6 +2537,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Mock provider to return 21000 as estimated gas
@@ -2596,6 +2600,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Provider should not be called when estimation is disabled
@@ -2656,6 +2661,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Mock provider to return 50000 as estimated gas
@@ -2717,6 +2723,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Mock provider to return an error

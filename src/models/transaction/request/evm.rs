@@ -6,6 +6,20 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use utoipa::{schema, ToSchema};
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default, ToSchema)]
+pub struct SignedAuthorizationItem {
+    pub chain_id: u64,
+    /// 0x-prefixed contract address to delegate to
+    pub address: String,
+    pub nonce: u64,
+    /// 0 or 1
+    pub y_parity: u8,
+    /// 0x-prefixed hex, 32 bytes
+    pub r: String,
+    /// 0x-prefixed hex, 32 bytes
+    pub s: String,
+}
+
 #[derive(Deserialize, Serialize, Default, ToSchema)]
 pub struct EvmTransactionRequest {
     #[schema(nullable = false)]
@@ -25,6 +39,8 @@ pub struct EvmTransactionRequest {
     pub max_priority_fee_per_gas: Option<u128>,
     #[schema(nullable = false)]
     pub valid_until: Option<String>,
+    #[schema(nullable = false)]
+    pub authorization_list: Option<Vec<SignedAuthorizationItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ToSchema)]
@@ -41,6 +57,7 @@ impl EvmTransactionRequest {
         validate_target_address(self, relayer)?;
         validate_evm_transaction_request(self, relayer)?;
         validate_price_params(self, relayer)?;
+        validate_authorization_list(self)?;
         Ok(())
     }
 }
@@ -184,6 +201,91 @@ pub fn validate_price_params(
     Ok(())
 }
 
+pub fn validate_authorization_list(request: &EvmTransactionRequest) -> Result<(), ApiError> {
+    let Some(list) = &request.authorization_list else {
+        return Ok(());
+    };
+
+    if list.is_empty() {
+        return Err(ApiError::BadRequest(
+            "authorization_list must not be empty when provided".to_string(),
+        ));
+    }
+
+    // EIP-7702 does not support contract creation — to must be set
+    if request.to.is_none() {
+        return Err(ApiError::BadRequest(
+            "EIP-7702 transactions require a `to` address (contract creation not supported)"
+                .to_string(),
+        ));
+    }
+
+    // EIP-7702 uses EIP-1559 pricing — gas_price (legacy) must not be set
+    if request.gas_price.is_some() {
+        return Err(ApiError::BadRequest(
+            "EIP-7702 transactions require EIP-1559 pricing (gas_price must not be set)"
+                .to_string(),
+        ));
+    }
+
+    for (i, item) in list.iter().enumerate() {
+        // Validate address: 0x + 40 hex chars
+        let addr_hex = item
+            .address
+            .strip_prefix("0x")
+            .or_else(|| item.address.strip_prefix("0X"))
+            .unwrap_or(&item.address);
+        if addr_hex.len() != 40 || hex::decode(addr_hex).is_err() {
+            return Err(ApiError::BadRequest(format!(
+                "authorization_list[{}]: invalid address '{}'",
+                i, item.address
+            )));
+        }
+
+        // y_parity must be 0 or 1
+        if item.y_parity > 1 {
+            return Err(ApiError::BadRequest(format!(
+                "authorization_list[{}]: y_parity must be 0 or 1",
+                i
+            )));
+        }
+
+        // r must be valid 32-byte hex
+        let r_hex = item
+            .r
+            .strip_prefix("0x")
+            .or_else(|| item.r.strip_prefix("0X"))
+            .unwrap_or(&item.r);
+        match hex::decode(r_hex) {
+            Ok(bytes) if bytes.len() == 32 => {}
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "authorization_list[{}]: r must be a 0x-prefixed 32-byte hex string",
+                    i
+                )));
+            }
+        }
+
+        // s must be valid 32-byte hex
+        let s_hex = item
+            .s
+            .strip_prefix("0x")
+            .or_else(|| item.s.strip_prefix("0X"))
+            .unwrap_or(&item.s);
+        match hex::decode(s_hex) {
+            Ok(bytes) if bytes.len() == 32 => {}
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "authorization_list[{}]: s must be a 0x-prefixed 32-byte hex string",
+                    i
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::models::{NetworkType, RelayerEvmPolicy, RelayerNetworkPolicy, RpcConfig};
@@ -202,6 +304,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         }
     }
 
@@ -551,6 +654,120 @@ mod tests {
             result.is_ok(),
             "validation should pass when gas_limit is provided and estimation is disabled"
         );
+    }
+
+    fn create_valid_auth_item() -> SignedAuthorizationItem {
+        SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "bb".repeat(32)),
+        }
+    }
+
+    fn create_eip7702_request() -> EvmTransactionRequest {
+        EvmTransactionRequest {
+            to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string()),
+            value: U256::from(0),
+            data: Some("0x".to_string()),
+            gas_limit: None,
+            gas_price: None,
+            speed: Some(Speed::Fast),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            valid_until: None,
+            authorization_list: Some(vec![create_valid_auth_item()]),
+        }
+    }
+
+    #[test]
+    fn test_validate_authorization_list_none_is_ok() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = None;
+        assert!(validate_authorization_list(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_authorization_list_valid() {
+        let request = create_eip7702_request();
+        assert!(validate_authorization_list(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_authorization_list_empty_is_err() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![]);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_requires_to() {
+        let mut request = create_eip7702_request();
+        request.to = None;
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("`to`")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_rejects_gas_price() {
+        let mut request = create_eip7702_request();
+        request.gas_price = Some(1_000_000_000);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("gas_price")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_invalid_address() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![SignedAuthorizationItem {
+            address: "notanaddress".to_string(),
+            ..create_valid_auth_item()
+        }]);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("invalid address")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_invalid_y_parity() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![SignedAuthorizationItem {
+            y_parity: 2,
+            ..create_valid_auth_item()
+        }]);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("y_parity")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_r_wrong_length() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![SignedAuthorizationItem {
+            r: "0xdeadbeef".to_string(), // only 4 bytes
+            ..create_valid_auth_item()
+        }]);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("32-byte")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_s_invalid_hex() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![SignedAuthorizationItem {
+            s: "0xnothex".to_string(),
+            ..create_valid_auth_item()
+        }]);
+        let result = validate_authorization_list(&request);
+        assert!(matches!(result, Err(ApiError::BadRequest(ref msg)) if msg.contains("32-byte")));
+    }
+
+    #[test]
+    fn test_validate_authorization_list_multiple_items() {
+        let mut request = create_eip7702_request();
+        request.authorization_list = Some(vec![create_valid_auth_item(), create_valid_auth_item()]);
+        assert!(validate_authorization_list(&request).is_ok());
     }
 
     #[test]

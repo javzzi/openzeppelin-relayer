@@ -6,6 +6,7 @@ pub use response::*;
 
 mod repository;
 pub use repository::*;
+pub(crate) use repository::signed_authorization_from_item;
 
 pub mod stellar;
 pub use stellar::{

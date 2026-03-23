@@ -1,6 +1,7 @@
 use crate::constants::{
     COMPLEX_GAS_LIMIT, DEFAULT_GAS_LIMIT, DEFAULT_TRANSACTION_SPEED, ERC20_TRANSFER_GAS_LIMIT,
     ERC721_TRANSFER_GAS_LIMIT, GAS_TX_CREATE_CONTRACT, GAS_TX_DATA_NONZERO, GAS_TX_DATA_ZERO,
+    PER_AUTH_BASE_COST,
 };
 use crate::models::evm::Speed;
 use crate::models::{EvmTransactionData, EvmTransactionRequest};
@@ -83,7 +84,13 @@ pub fn calculate_intrinsic_gas(tx: &EvmTransactionRequest) -> u64 {
         None => 0,
     };
 
-    base_gas + data_gas
+    let auth_gas = tx
+        .authorization_list
+        .as_ref()
+        .map(|list| list.len() as u64 * PER_AUTH_BASE_COST)
+        .unwrap_or(0);
+
+    base_gas + data_gas + auth_gas
 }
 
 /// Calculates the gas for a given transaction data
@@ -175,6 +182,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(get_evm_default_gas_limit_for_tx(&tx), DEFAULT_GAS_LIMIT);
@@ -197,6 +205,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(
@@ -222,6 +231,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(
@@ -247,6 +257,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(get_evm_default_gas_limit_for_tx(&tx), COMPLEX_GAS_LIMIT);
@@ -269,6 +280,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(get_evm_default_gas_limit_for_tx(&tx), COMPLEX_GAS_LIMIT);
@@ -291,6 +303,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         assert_eq!(get_evm_default_gas_limit_for_tx(&tx), COMPLEX_GAS_LIMIT);
@@ -314,6 +327,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Should still match ERC20 transfer since it starts with the signature
@@ -341,6 +355,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         // Should not match since the function signature is case-sensitive
@@ -378,6 +393,62 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_intrinsic_gas_with_authorization_list() {
+        use crate::models::transaction::request::evm::SignedAuthorizationItem;
+        let auth_item = SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "bb".repeat(32)),
+        };
+        let tx = EvmTransactionRequest {
+            to: Some("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed".to_string()),
+            value: crate::models::U256::from(0u128),
+            data: None,
+            gas_limit: None,
+            gas_price: None,
+            speed: Some(Speed::Fast),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            valid_until: None,
+            authorization_list: Some(vec![auth_item]),
+        };
+        // 21000 base + 1 * PER_AUTH_BASE_COST (25000)
+        assert_eq!(calculate_intrinsic_gas(&tx), DEFAULT_GAS_LIMIT + PER_AUTH_BASE_COST);
+    }
+
+    #[test]
+    fn test_calculate_intrinsic_gas_with_multiple_authorizations() {
+        use crate::models::transaction::request::evm::SignedAuthorizationItem;
+        let make_auth = || SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "bb".repeat(32)),
+        };
+        let tx = EvmTransactionRequest {
+            to: Some("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed".to_string()),
+            value: crate::models::U256::from(0u128),
+            data: None,
+            gas_limit: None,
+            gas_price: None,
+            speed: Some(Speed::Fast),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            valid_until: None,
+            authorization_list: Some(vec![make_auth(), make_auth(), make_auth()]),
+        };
+        assert_eq!(
+            calculate_intrinsic_gas(&tx),
+            DEFAULT_GAS_LIMIT + 3 * PER_AUTH_BASE_COST
+        );
+    }
+
+    #[test]
     fn test_calculate_intrinsic_gas_regular_transaction_no_data() {
         let tx = EvmTransactionRequest {
             to: Some("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed".to_string()),
@@ -389,6 +460,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         assert_eq!(calculate_intrinsic_gas(&tx), DEFAULT_GAS_LIMIT);
@@ -406,6 +478,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         assert_eq!(calculate_intrinsic_gas(&tx), GAS_TX_CREATE_CONTRACT);
@@ -423,6 +496,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         let expected_gas = DEFAULT_GAS_LIMIT + 4 * GAS_TX_DATA_NONZERO;
@@ -441,6 +515,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         // 1 zero byte + 3 non-zero bytes
@@ -460,6 +535,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         // 1 zero byte + 3 non-zero bytes
@@ -479,6 +555,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         // Invalid hex should result in 0 data gas
@@ -497,6 +574,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         // Empty data should result in 0 data gas
@@ -515,6 +593,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         let data_bytes = hex::decode("a9059cbb000000000000000000000000742d35cc6634c0532925a3b844bc454e4438f44e0000000000000000000000000000000000000000000000000de0b6b3a7640000").unwrap();
@@ -539,6 +618,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         // 1000 non-zero bytes

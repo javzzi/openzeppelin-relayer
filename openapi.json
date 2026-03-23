@@ -6404,6 +6404,12 @@
           "value"
         ],
         "properties": {
+          "authorization_list": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignedAuthorizationItem"
+            }
+          },
           "data": {
             "type": "string"
           },
@@ -8485,6 +8491,47 @@
           },
           "hash_struct_message": {
             "type": "string"
+          }
+        }
+      },
+      "SignedAuthorizationItem": {
+        "type": "object",
+        "required": [
+          "chain_id",
+          "address",
+          "nonce",
+          "y_parity",
+          "r",
+          "s"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "0x-prefixed contract address to delegate to"
+          },
+          "chain_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "nonce": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "r": {
+            "type": "string",
+            "description": "0x-prefixed hex, 32 bytes"
+          },
+          "s": {
+            "type": "string",
+            "description": "0x-prefixed hex, 32 bytes"
+          },
+          "y_parity": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 or 1",
+            "minimum": 0
           }
         }
       },

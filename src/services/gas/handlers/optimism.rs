@@ -194,6 +194,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let original_params = PriceParams {
@@ -238,6 +239,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let size =
@@ -286,6 +288,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
         };
 
         let result = handler.calculate_fee(&fee_data, &tx);

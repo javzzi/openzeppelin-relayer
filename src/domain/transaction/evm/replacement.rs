@@ -438,6 +438,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         }
     }
 
@@ -457,6 +458,7 @@ mod tests {
             max_fee_per_gas: Some(30_000_000_000), // 30 gwei
             max_priority_fee_per_gas: Some(2_000_000_000), // 2 gwei
             raw: None,
+            authorization_list: None,
         }
     }
 

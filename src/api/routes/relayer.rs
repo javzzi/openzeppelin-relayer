@@ -370,6 +370,7 @@ mod tests {
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 raw: None,
+                authorization_list: None,
             }),
             priced_at: None,
             hashes: vec!["0xabcdef".to_string()],

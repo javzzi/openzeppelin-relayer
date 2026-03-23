@@ -14,6 +14,12 @@ pub const GAS_TX_CREATE_CONTRACT: u64 = 53000;
 pub const GAS_TX_DATA_ZERO: u64 = 4; // Cost per zero byte in data
 pub const GAS_TX_DATA_NONZERO: u64 = 16; // Cost per non-zero byte in data
 
+/// Per-authorization intrinsic gas cost for EIP-7702 transactions.
+/// This is PER_EMPTY_ACCOUNT_COST from the EIP-7702 spec — charged upfront per authorization
+/// tuple in the intrinsic gas calculation. The 12500 value is only the refund applied during
+/// execution when the authority account already exists in state.
+pub const PER_AUTH_BASE_COST: u64 = 25000;
+
 /// Gas limit buffer multiplier for automatic gas limit estimation, 10% increase
 pub const GAS_LIMIT_BUFFER_MULTIPLIER: u64 = 110;
 

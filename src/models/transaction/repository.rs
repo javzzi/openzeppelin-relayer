@@ -26,8 +26,9 @@ use crate::{
     utils::{deserialize_optional_u128, serialize_optional_u128},
 };
 use alloy::{
-    consensus::{TxEip1559, TxLegacy},
-    primitives::{Address as AlloyAddress, Bytes, TxKind},
+    consensus::{TxEip1559, TxEip7702, TxLegacy},
+    eips::eip7702::Authorization,
+    primitives::{Address as AlloyAddress, Bytes, Signature, TxKind, U256 as AlloyU256},
     rpc::types::AccessList,
 };
 
@@ -330,6 +331,8 @@ pub struct EvmTransactionData {
     )]
     pub max_priority_fee_per_gas: Option<u128>,
     pub raw: Option<Vec<u8>>,
+    #[serde(default)]
+    pub authorization_list: Option<Vec<super::evm::SignedAuthorizationItem>>,
 }
 
 impl EvmTransactionData {
@@ -371,6 +374,7 @@ impl EvmTransactionData {
             signature: None,
             hash: None,
             raw: None,
+            authorization_list: old_data.authorization_list.clone(),
         }
     }
 
@@ -446,6 +450,7 @@ impl Default for EvmTransactionData {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         }
     }
 }
@@ -478,6 +483,7 @@ pub trait EvmTransactionDataTrait {
     fn is_legacy(&self) -> bool;
     fn is_eip1559(&self) -> bool;
     fn is_speed(&self) -> bool;
+    fn is_eip7702(&self) -> bool;
 }
 
 impl EvmTransactionDataTrait for EvmTransactionData {
@@ -491,6 +497,12 @@ impl EvmTransactionDataTrait for EvmTransactionData {
 
     fn is_speed(&self) -> bool {
         self.speed.is_some()
+    }
+
+    fn is_eip7702(&self) -> bool {
+        self.authorization_list
+            .as_ref()
+            .is_some_and(|list| !list.is_empty())
     }
 }
 
@@ -970,6 +982,7 @@ impl
                         max_fee_per_gas: evm_request.max_fee_per_gas,
                         max_priority_fee_per_gas: evm_request.max_priority_fee_per_gas,
                         raw: None,
+                        authorization_list: evm_request.authorization_list.clone(),
                     }),
                     priced_at: None,
                     hashes: Vec::new(),
@@ -1192,6 +1205,106 @@ impl TryFrom<EvmTransactionData> for TxEip1559 {
     }
 }
 
+pub(crate) fn signed_authorization_from_item(
+    item: &super::evm::SignedAuthorizationItem,
+) -> Result<alloy::eips::eip7702::SignedAuthorization, SignerError> {
+    let address: AlloyAddress = item.address.parse().map_err(|_| {
+        SignerError::SigningError(format!("Invalid authorization address: {}", item.address))
+    })?;
+
+    let r_hex = item
+        .r
+        .strip_prefix("0x")
+        .or_else(|| item.r.strip_prefix("0X"))
+        .unwrap_or(&item.r);
+    let s_hex = item
+        .s
+        .strip_prefix("0x")
+        .or_else(|| item.s.strip_prefix("0X"))
+        .unwrap_or(&item.s);
+
+    let r_bytes = hex::decode(r_hex)
+        .map_err(|_| SignerError::SigningError(format!("Invalid authorization r: {}", item.r)))?;
+    let s_bytes = hex::decode(s_hex)
+        .map_err(|_| SignerError::SigningError(format!("Invalid authorization s: {}", item.s)))?;
+
+    if r_bytes.len() != 32 || s_bytes.len() != 32 {
+        return Err(SignerError::SigningError(
+            "Authorization r/s must be 32 bytes".to_string(),
+        ));
+    }
+
+    let mut r_arr = [0u8; 32];
+    let mut s_arr = [0u8; 32];
+    r_arr.copy_from_slice(&r_bytes);
+    s_arr.copy_from_slice(&s_bytes);
+
+    let r = AlloyU256::from_be_bytes(r_arr);
+    let s = AlloyU256::from_be_bytes(s_arr);
+    let sig = Signature::new(r, s, item.y_parity != 0);
+
+    let auth = Authorization {
+        chain_id: AlloyU256::from(item.chain_id),
+        address,
+        nonce: item.nonce,
+    };
+
+    Ok(auth.into_signed(sig))
+}
+
+impl TryFrom<NetworkTransactionData> for TxEip7702 {
+    type Error = SignerError;
+
+    fn try_from(tx: NetworkTransactionData) -> Result<Self, Self::Error> {
+        match tx {
+            NetworkTransactionData::Evm(tx) => Self::try_from(&tx),
+            _ => Err(SignerError::SigningError(
+                "Not an EVM transaction".to_string(),
+            )),
+        }
+    }
+}
+
+impl TryFrom<&EvmTransactionData> for TxEip7702 {
+    type Error = SignerError;
+
+    fn try_from(tx: &EvmTransactionData) -> Result<Self, Self::Error> {
+        let to: AlloyAddress = tx
+            .to
+            .as_ref()
+            .ok_or_else(|| {
+                SignerError::SigningError(
+                    "EIP-7702 transactions require a `to` address".to_string(),
+                )
+            })?
+            .parse()
+            .map_err(|_| {
+                SignerError::SigningError("Invalid `to` address for EIP-7702 transaction".to_string())
+            })?;
+
+        let authorization_list = tx
+            .authorization_list
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(signed_authorization_from_item)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            chain_id: tx.chain_id,
+            nonce: tx.nonce.unwrap_or(0),
+            gas_limit: tx.gas_limit.unwrap_or(DEFAULT_GAS_LIMIT),
+            max_fee_per_gas: tx.max_fee_per_gas.unwrap_or(0),
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas.unwrap_or(0),
+            to,
+            value: tx.value,
+            access_list: AccessList::default(),
+            authorization_list,
+            input: tx.data_to_bytes()?,
+        })
+    }
+}
+
 impl From<&[u8; 65]> for EvmTransactionDataSignature {
     fn from(bytes: &[u8; 65]) -> Self {
         Self {
@@ -1227,6 +1340,130 @@ mod tests {
     // Use a mutex to ensure tests don't run in parallel when modifying env vars
     lazy_static! {
         static ref ENV_MUTEX: Mutex<()> = Mutex::new(());
+    }
+
+    fn make_valid_auth_item() -> super::super::evm::SignedAuthorizationItem {
+        super::super::evm::SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "1b".repeat(32)), // non-zero, valid hex
+        }
+    }
+
+    fn make_eip7702_evm_data() -> EvmTransactionData {
+        EvmTransactionData {
+            from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            gas_limit: Some(100_000),
+            nonce: Some(5),
+            value: crate::models::U256::from(0u64),
+            data: Some("0x".to_string()),
+            chain_id: 1,
+            max_fee_per_gas: Some(30_000_000_000),
+            max_priority_fee_per_gas: Some(1_000_000_000),
+            authorization_list: Some(vec![make_valid_auth_item()]),
+            hash: None,
+            signature: None,
+            raw: None,
+            gas_price: None,
+            speed: None,
+        }
+    }
+
+    #[test]
+    fn test_is_eip7702_true_when_auth_list_present() {
+        let tx = make_eip7702_evm_data();
+        assert!(tx.is_eip7702());
+    }
+
+    #[test]
+    fn test_is_eip7702_false_when_no_auth_list() {
+        let tx = EvmTransactionData {
+            authorization_list: None,
+            ..make_eip7702_evm_data()
+        };
+        assert!(!tx.is_eip7702());
+    }
+
+    #[test]
+    fn test_is_eip7702_false_when_empty_auth_list() {
+        let tx = EvmTransactionData {
+            authorization_list: Some(vec![]),
+            ..make_eip7702_evm_data()
+        };
+        assert!(!tx.is_eip7702());
+    }
+
+    #[test]
+    fn test_signed_authorization_from_item_valid() {
+        let item = make_valid_auth_item();
+        let result = signed_authorization_from_item(&item);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn test_signed_authorization_from_item_invalid_address() {
+        let mut item = make_valid_auth_item();
+        item.address = "notanaddress".to_string();
+        assert!(signed_authorization_from_item(&item).is_err());
+    }
+
+    #[test]
+    fn test_signed_authorization_from_item_r_wrong_length() {
+        let mut item = make_valid_auth_item();
+        item.r = "0xdeadbeef".to_string(); // 4 bytes, not 32
+        assert!(signed_authorization_from_item(&item).is_err());
+    }
+
+    #[test]
+    fn test_signed_authorization_from_item_s_invalid_hex() {
+        let mut item = make_valid_auth_item();
+        item.s = "0xzzzzzz".to_string();
+        assert!(signed_authorization_from_item(&item).is_err());
+    }
+
+    #[test]
+    fn test_try_from_evm_data_for_tx_eip7702() {
+        let tx = make_eip7702_evm_data();
+        let result = TxEip7702::try_from(&tx);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let tx7702 = result.unwrap();
+        assert_eq!(tx7702.chain_id, 1);
+        assert_eq!(tx7702.nonce, 5);
+        assert_eq!(tx7702.gas_limit, 100_000);
+        assert_eq!(tx7702.max_fee_per_gas, 30_000_000_000);
+        assert_eq!(tx7702.authorization_list.len(), 1);
+    }
+
+    #[test]
+    fn test_try_from_evm_data_for_tx_eip7702_missing_to_errors() {
+        let tx = EvmTransactionData {
+            to: None,
+            ..make_eip7702_evm_data()
+        };
+        let result = TxEip7702::try_from(&tx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_eip7702_serde_round_trip() {
+        let tx = make_eip7702_evm_data();
+        let json = serde_json::to_string(&tx).unwrap();
+        let decoded: EvmTransactionData = serde_json::from_str(&json).unwrap();
+        assert!(decoded.is_eip7702());
+        assert_eq!(decoded.authorization_list.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_evm_data_without_auth_list_deserializes_without_field() {
+        // Backward compat: old Redis data without authorization_list field
+        let json = r#"{"from":"0x742d35Cc6634C0532925a3b844Bc454e4438f44e","to":"0xdead","gas_limit":21000,"nonce":0,"value":"0x0","data":"0x","chain_id":1,"gas_price":1000000000}"#;
+        let result: Result<EvmTransactionData, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        assert!(result.unwrap().authorization_list.is_none());
     }
 
     #[test]
@@ -1427,6 +1664,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         }
     }
 
@@ -1813,6 +2051,7 @@ mod tests {
             max_priority_fee_per_gas: Some(2000000000), // Should be ignored
             speed: Some(Speed::Fast),
             valid_until: None,
+            authorization_list: None,
         };
 
         let result = EvmTransactionData::for_replacement(&old_data, &new_request);
@@ -1861,6 +2100,7 @@ mod tests {
             max_priority_fee_per_gas: None,
             speed: Some(Speed::Fast),
             valid_until: Some("2024-12-31T23:59:59Z".to_string()),
+            authorization_list: None,
         });
 
         let relayer_model = RelayerRepoModel {
@@ -2222,6 +2462,7 @@ mod tests {
             max_priority_fee_per_gas: None,
             speed: None,
             valid_until: None,
+            authorization_list: None,
         };
 
         let result = EvmTransactionData::for_replacement(&old_data, &new_request);
@@ -3217,6 +3458,7 @@ mod tests {
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 raw: None,
+                authorization_list: None,
             }),
             priced_at: None,
             hashes: vec![],

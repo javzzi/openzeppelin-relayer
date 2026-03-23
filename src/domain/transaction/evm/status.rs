@@ -1430,6 +1430,7 @@ mod tests {
                 hash: None,
                 speed: Some(Speed::Fast),
                 raw: None,
+                authorization_list: None,
             }),
             priced_at: None,
             hashes: Vec::new(),

@@ -300,6 +300,7 @@ pub mod mockutils {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             valid_until: None,
+            authorization_list: None,
         }
     }
 

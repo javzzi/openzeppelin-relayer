@@ -33,6 +33,7 @@ use tracing::debug;
 
 use super::rpc_selector::RpcSelector;
 use super::{retry_rpc_call, ProviderConfig, RetryConfig};
+use crate::models::transaction::signed_authorization_from_item;
 use crate::{
     models::{
         BlockResponse, EvmTransactionData, RpcConfig, TransactionError, TransactionReceipt, U256,
@@ -521,6 +522,21 @@ impl TryFrom<&EvmTransactionData> for TransactionRequest {
                     })
                 })
                 .transpose()?,
+            authorization_list: tx
+                .authorization_list
+                .as_deref()
+                .map(|list| {
+                    list.iter()
+                        .map(|item| {
+                            signed_authorization_from_item(item).map_err(|e| {
+                                TransactionError::InvalidType(format!(
+                                    "Invalid authorization item: {e}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?,
             ..Default::default()
         })
     }
@@ -700,6 +716,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         let result = TransactionRequest::try_from(&tx_data);
@@ -818,6 +835,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         mock.expect_estimate_gas()
@@ -858,6 +876,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         let result = TransactionRequest::try_from(&tx_data);
@@ -881,6 +900,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         let result = TransactionRequest::try_from(&tx_data);
@@ -906,6 +926,7 @@ mod tests {
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         let result = TransactionRequest::try_from(&tx_data);

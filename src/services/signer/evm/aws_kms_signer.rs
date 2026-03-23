@@ -178,6 +178,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             speed: None,

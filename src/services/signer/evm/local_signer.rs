@@ -14,7 +14,7 @@
 //! This implementation stores private keys in memory and should primarily be used
 //! for development and testing purposes, not production
 use alloy::{
-    consensus::{SignableTransaction, TxEip1559, TxLegacy},
+    consensus::{SignableTransaction, TxEip1559, TxEip7702, TxLegacy},
     network::{EthereumWallet, TransactionBuilder, TxSigner},
     rpc::types::Transaction,
     signers::{
@@ -88,7 +88,36 @@ impl Signer for LocalSigner {
         transaction: NetworkTransactionData,
     ) -> Result<SignTransactionResponse, SignerError> {
         let evm_data = transaction.get_evm_transaction_data()?;
-        if evm_data.is_eip1559() {
+        if evm_data.is_eip7702() {
+            let mut unsigned_tx = TxEip7702::try_from(transaction)?;
+
+            let signature = self
+                .local_signer_client
+                .sign_transaction(&mut unsigned_tx)
+                .await
+                .map_err(|e| {
+                    SignerError::SigningError(format!("Failed to sign EIP-7702 transaction: {e}"))
+                })?;
+
+            let signed_tx = unsigned_tx.into_signed(signature);
+            let mut signature_bytes = signature.as_bytes();
+
+            // Adjust v value for EIP-7702 (same as EIP-1559: 27/28 -> 0/1)
+            if signature_bytes[64] == 27 {
+                signature_bytes[64] = 0;
+            } else if signature_bytes[64] == 28 {
+                signature_bytes[64] = 1;
+            }
+
+            let mut raw = Vec::with_capacity(signed_tx.eip2718_encoded_length());
+            signed_tx.eip2718_encode(&mut raw);
+
+            Ok(SignTransactionResponse::Evm(SignTransactionResponseEvm {
+                hash: signed_tx.hash().to_string(),
+                signature: EvmTransactionDataSignature::from(&signature_bytes),
+                raw,
+            }))
+        } else if evm_data.is_eip1559() {
             let mut unsigned_tx = TxEip1559::try_from(transaction)?;
 
             let signature = self
@@ -205,6 +234,7 @@ mod tests {
             hash: None,
             signature: None,
             raw: None,
+            authorization_list: None,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             speed: None,
@@ -286,6 +316,52 @@ mod tests {
                 assert!(!signed_tx.signature.sig.is_empty());
             }
             _ => panic!("Expected EVM transaction response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_eip7702_transaction() {
+        use crate::models::transaction::request::evm::SignedAuthorizationItem;
+        let signer = LocalSigner::new(&create_test_signer_model()).unwrap();
+        let auth_item = SignedAuthorizationItem {
+            chain_id: 1,
+            address: "0x0000Fb7702036ff9f76044a501ac1aA74cbab16b".to_string(),
+            nonce: 0,
+            y_parity: 0,
+            r: format!("0x{}", "aa".repeat(32)),
+            s: format!("0x{}", "1b".repeat(32)),
+        };
+        let tx = NetworkTransactionData::Evm(EvmTransactionData {
+            from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            gas_price: None,
+            max_fee_per_gas: Some(30_000_000_000),
+            max_priority_fee_per_gas: Some(1_000_000_000),
+            gas_limit: Some(100_000),
+            nonce: Some(0),
+            value: U256::from(0u64),
+            data: Some("0x".to_string()),
+            chain_id: 1,
+            hash: None,
+            signature: None,
+            raw: None,
+            authorization_list: Some(vec![auth_item]),
+            speed: None,
+        });
+
+        let result = signer.sign_transaction(tx).await;
+        assert!(result.is_ok(), "EIP-7702 signing failed: {:?}", result);
+
+        match result.unwrap() {
+            SignTransactionResponse::Evm(signed) => {
+                assert!(!signed.hash.is_empty());
+                // EIP-7702 raw tx must start with type byte 0x04
+                assert_eq!(signed.raw[0], 0x04, "expected type 0x04 prefix");
+                assert!(signed.signature.v == 0 || signed.signature.v == 1);
+                assert_eq!(signed.signature.r.len(), 64);
+                assert_eq!(signed.signature.s.len(), 64);
+            }
+            _ => panic!("Expected Evm response"),
         }
     }
 
