@@ -124,6 +124,24 @@ async fn handle_request(
         eyre::eyre!("load index reconciliation: failed to get Redis connection: {e}")
     })?;
 
+    // Ensure relayer_network reverse lookup key exists for ALL relayers
+    for relayer in &relayers {
+        let network_key = format!("{}:relayer_network:{}", prefix, relayer.id);
+        let network_value = format!("{}:{}", relayer.network_type, relayer.network);
+
+        if let Err(e) = conn
+            .set::<_, _, ()>(&network_key, &network_value)
+            .await
+        {
+            warn!(
+                relayer_id = %relayer.id,
+                error = %e,
+                "load index reconciliation: failed to set relayer_network key"
+            );
+        }
+    }
+
+    // Update load index scores only for active relayers
     for relayer in relayers.iter().filter(|r| !r.paused && !r.system_disabled) {
         let count = data
             .transaction_repository

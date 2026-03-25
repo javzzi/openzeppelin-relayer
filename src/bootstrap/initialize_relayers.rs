@@ -475,6 +475,24 @@ async fn populate_load_index<TR>(
         }
     };
 
+    // Ensure relayer_network reverse lookup key exists for ALL relayers
+    for relayer in relayers {
+        let network_key = format!("{}:relayer_network:{}", prefix, relayer.id);
+        let network_value = format!("{}:{}", relayer.network_type, relayer.network);
+
+        if let Err(e) = conn
+            .set::<_, _, ()>(&network_key, &network_value)
+            .await
+        {
+            warn!(
+                relayer_id = %relayer.id,
+                error = %e,
+                "load index: failed to set relayer_network key during bootstrap"
+            );
+        }
+    }
+
+    // Populate load index scores only for active (non-paused, non-disabled) relayers
     for relayer in relayers.iter().filter(|r| !r.paused && !r.system_disabled) {
         let count = transaction_repository
             .count_by_status(&relayer.id, &in_flight_statuses)
