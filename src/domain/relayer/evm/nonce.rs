@@ -326,6 +326,7 @@ where
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             raw: None,
+            authorization_list: None,
         };
 
         crate::domain::evm::make_noop(&mut evm_data, &evm_network, Some(&self.provider))
